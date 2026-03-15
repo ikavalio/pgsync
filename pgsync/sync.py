@@ -341,10 +341,12 @@ class Sync(Base, metaclass=Singleton):
 
         with self.advisory_lock(
             self.database, max_retries=None, retry_interval=0.1
-        ):
+        ) as conn:
             if if_not_exists:
 
-                self.teardown(drop_view=False, polling=polling, wal=wal)
+                self.teardown(
+                    drop_view=False, polling=polling, wal=wal, conn=conn
+                )
 
             if not polling and not wal:
                 for schema in self.schemas:
@@ -433,6 +435,7 @@ class Sync(Base, metaclass=Singleton):
         drop_view: bool = True,
         polling: bool = False,
         wal: bool = False,
+        conn: t.Optional[sa.engine.Connection] = None,
     ) -> None:
         """Drop the database triggers and replication slot."""
         if self.is_mysql_compat:
@@ -443,7 +446,7 @@ class Sync(Base, metaclass=Singleton):
         join_queries: bool = settings.JOIN_QUERIES
 
         with self.advisory_lock(
-            self.database, max_retries=None, retry_interval=0.1
+            self.database, max_retries=None, retry_interval=0.1, conn=conn
         ):
             try:
                 os.unlink(self.checkpoint_file)

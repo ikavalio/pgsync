@@ -2,7 +2,7 @@
 
 import pytest
 import sqlalchemy as sa
-from mock import call, patch
+from mock import ANY, call, patch
 
 from pgsync.base import (
     _pg_engine,
@@ -21,7 +21,7 @@ from pgsync.exc import (
     ReplicationSlotError,
     TableNotFoundError,
 )
-from pgsync.settings import IS_MYSQL_COMPAT
+from pgsync.settings import IS_MYSQL_COMPAT, PG_DATABASE
 from pgsync.view import CreateView, DropView
 
 
@@ -60,20 +60,20 @@ class TestBase(object):
                     "Replication slot foo already exists"
                 )
         assert mock_slot.call_args_list == [
-            call("foo"),
-            call("foo"),
+            call("foo", conn=ANY),
+            call("foo", conn=ANY),
         ]
 
         with patch("pgsync.base.Base.drop_replication_slot") as mock_slot:
             pg_base._can_create_replication_slot("bar")
-            mock_slot.assert_called_once_with("bar")
+            mock_slot.assert_called_once_with("bar", conn=ANY)
 
         with patch(
             "pgsync.base.Base.create_replication_slot", side_effect=Exception
         ) as mock_slot:
             with pytest.raises(ReplicationSlotError) as excinfo:
                 pg_base._can_create_replication_slot("barx")
-            mock_slot.assert_called_once_with("barx")
+            mock_slot.assert_called_once_with("barx", conn=ANY)
             msg = (
                 f'PG_USER "{pg_base.engine.url.username}" needs to be '
                 f"superuser or have permission to read, create and destroy "
@@ -357,7 +357,7 @@ class TestBase(object):
         assert mock_logger.debug.call_count == 2
         mock_logger.debug.assert_any_call(f"Creating database: {database}")
         mock_logger.debug.assert_any_call(f"Created database: {database}")
-        mock_pg_engine.assert_any_call("postgres", echo=True)
+        mock_pg_engine.assert_any_call(PG_DATABASE, echo=True)
         calls = [call(mock_pg_engine, f'CREATE DATABASE "{database}"')]
         mock_pg_execute.call_args_list == calls
 
@@ -376,7 +376,7 @@ class TestBase(object):
         assert mock_logger.debug.call_count == 2
         mock_logger.debug.assert_any_call(f"Dropping database: {database}")
         mock_logger.debug.assert_any_call(f"Dropped database: {database}")
-        mock_pg_engine.assert_any_call("postgres", echo=True)
+        mock_pg_engine.assert_any_call(PG_DATABASE, echo=True)
         calls = [call(mock_pg_engine, f'DROP DATABASE "{database}"')]
         mock_pg_execute.call_args_list == calls
 
