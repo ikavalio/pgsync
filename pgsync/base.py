@@ -6,7 +6,7 @@ import random
 import threading
 import time
 import typing as t
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 
 import psycopg2
 import sqlalchemy as sa
@@ -278,15 +278,15 @@ class Base(object):
         """Check if the given user can create and destroy replication slots."""
         with self.advisory_lock(
             slot_name, max_retries=None, retry_interval=0.1
-        ):
+        ) as conn:
             if self.replication_slots(slot_name):
                 logger.exception(
                     f"Replication slot {slot_name} already exists"
                 )
-                self.drop_replication_slot(slot_name)
+                self.drop_replication_slot(slot_name, conn=conn)
 
             try:
-                self.create_replication_slot(slot_name)
+                self.create_replication_slot(slot_name, conn=conn)
 
             except Exception as e:
                 logger.exception(f"{e}")
@@ -296,7 +296,7 @@ class Base(object):
                     f"replication slots to perform this action.\n{e}"
                 )
             else:
-                self.drop_replication_slot(slot_name)
+                self.drop_replication_slot(slot_name, conn=conn)
 
     # Tables...
     def models(self, table: str, schema: str) -> sa.sql.Alias:
@@ -505,7 +505,11 @@ class Base(object):
             label="replication_slots",
         )
 
-    def create_replication_slot(self, slot_name: str) -> None:
+    def create_replication_slot(
+        self,
+        slot_name: str,
+        conn: t.Optional[sa.engine.Connection] = None,
+    ) -> None:
         """Create a replication slot.
 
         TODO:
@@ -517,7 +521,7 @@ class Base(object):
         logger.debug(f"Creating replication slot: {slot_name}")
         try:
             with self.advisory_lock(
-                slot_name, max_retries=None, retry_interval=0.1
+                slot_name, max_retries=None, retry_interval=0.1, conn=conn
             ):
                 self.execute(
                     sa.select("*").select_from(
@@ -532,13 +536,17 @@ class Base(object):
             raise
         logger.debug(f"Created replication slot: {slot_name}")
 
-    def drop_replication_slot(self, slot_name: str) -> None:
+    def drop_replication_slot(
+        self,
+        slot_name: str,
+        conn: t.Optional[sa.engine.Connection] = None,
+    ) -> None:
         """Drop a replication slot."""
         logger.debug(f"Dropping replication slot: {slot_name}")
         if self.replication_slots(slot_name):
             try:
                 with self.advisory_lock(
-                    slot_name, max_retries=None, retry_interval=0.1
+                    slot_name, max_retries=None, retry_interval=0.1, conn=conn
                 ):
                     self.execute(
                         sa.select("*").select_from(
@@ -569,7 +577,10 @@ class Base(object):
         return row[0]
 
     def pg_try_advisory_lock(
-        self, key: t.Union[int, str], timeout: int = 0
+        self,
+        key: t.Union[int, str],
+        timeout: int = 0,
+        conn: t.Optional[sa.engine.Connection] = None,
     ) -> bool:
         """
         Attempts to acquire an dvisory/named lock based on a hashed slot name without blocking.
@@ -585,16 +596,22 @@ class Base(object):
             row = self.fetchone(
                 sa.text("SELECT GET_LOCK(:name, :timeout)").bindparams(
                     name=str(key), timeout=int(timeout)
-                )
+                ),
+                conn=conn,
             )
             return bool(row and row[0] == 1)
 
         row = self.fetchone(
-            sa.text("SELECT PG_TRY_ADVISORY_LOCK(:key)").bindparams(key=key)
+            sa.text("SELECT PG_TRY_ADVISORY_LOCK(:key)").bindparams(key=key),
+            conn=conn,
         )
         return bool(row and row[0])
 
-    def pg_advisory_unlock(self, key: t.Union[int, str]) -> bool:
+    def pg_advisory_unlock(
+        self,
+        key: t.Union[int, str],
+        conn: t.Optional[sa.engine.Connection] = None,
+    ) -> bool:
         """
         Releases an advisory lock associated with the hashed slot name.
 
@@ -603,12 +620,16 @@ class Base(object):
         """
         if self.is_mysql_compat:
             row = self.fetchone(
-                sa.text("SELECT RELEASE_LOCK(:name)").bindparams(name=str(key))
+                sa.text("SELECT RELEASE_LOCK(:name)").bindparams(
+                    name=str(key)
+                ),
+                conn=conn,
             )
             return bool(row and row[0] == 1)
 
         row = self.fetchone(
-            sa.text("SELECT PG_ADVISORY_UNLOCK(:key)").bindparams(key=key)
+            sa.text("SELECT PG_ADVISORY_UNLOCK(:key)").bindparams(key=key),
+            conn=conn,
         )
         return bool(row and row[0])
 
@@ -622,11 +643,19 @@ class Base(object):
         backoff_factor: float = 2.0,
         jitter: str = "full",  # "none" | "full" | "equal" | "decorrelated"
         max_delay: float = 30.0,  # cap for delay growth
+        conn: t.Optional[sa.engine.Connection] = None,
     ):
         """
         Context manager to acquire a PostgreSQL advisory lock with optional retries.
         Acquire a PostgreSQL advisory lock with retries, backoff, and jitter.
         Jitter reduces lock-step contention so callers don't starve.
+
+        Yields the connection used to hold the lock so callers can pass it to
+        nested advisory_lock calls, enabling re-entrant use on the same session.
+
+        If ``conn`` is provided the caller's connection is used directly and its
+        lifecycle is not managed here (no open/close).  Pass the same connection
+        to a nested advisory_lock to re-enter on the same PostgreSQL session.
         """
         key: int = self.advisory_key(slot_name)
         attempt: int = 0
@@ -635,50 +664,55 @@ class Base(object):
         # current backoff window (seconds)
         delay: float = base_delay
 
-        while True:
-            if self.pg_try_advisory_lock(key):
-                break
+        with (
+            nullcontext(conn) if conn is not None else self.engine.connect()
+        ) as c:
+            while True:
+                if self.pg_try_advisory_lock(key, conn=c):
+                    break
 
-            if (max_retries is not None) and (attempt >= max_retries):
-                raise RuntimeError(
-                    f"Failed to acquire advisory lock for '{slot_name}' after {max_retries} retries."
-                )
-
-            # Compute sleep using jitter strategy
-            if jitter == "decorrelated":
-                # Decorrelated jitter chooses the *next* delay first.
-                delay = min(max_delay, random.uniform(base_delay, delay * 3))
-                sleep_for = delay
-            else:
-                # For other modes, sleep is derived from current delay.
-                if jitter == "full":
-                    sleep_for = random.uniform(0.0, delay)
-                elif jitter == "equal":
-                    sleep_for = (delay / 2.0) + random.uniform(
-                        0.0, delay / 2.0
+                if (max_retries is not None) and (attempt >= max_retries):
+                    raise RuntimeError(
+                        f"Failed to acquire advisory lock for '{slot_name}' after {max_retries} retries."
                     )
-                elif jitter == "none":
+
+                # Compute sleep using jitter strategy
+                if jitter == "decorrelated":
+                    # Decorrelated jitter chooses the *next* delay first.
+                    delay = min(
+                        max_delay, random.uniform(base_delay, delay * 3)
+                    )
                     sleep_for = delay
                 else:
-                    # Fallback to full jitter if an unknown option is passed
-                    sleep_for = random.uniform(0.0, delay)
+                    # For other modes, sleep is derived from current delay.
+                    if jitter == "full":
+                        sleep_for = random.uniform(0.0, delay)
+                    elif jitter == "equal":
+                        sleep_for = (delay / 2.0) + random.uniform(
+                            0.0, delay / 2.0
+                        )
+                    elif jitter == "none":
+                        sleep_for = delay
+                    else:
+                        # Fallback to full jitter if an unknown option is passed
+                        sleep_for = random.uniform(0.0, delay)
 
-            time.sleep(max(0.0, sleep_for))
+                time.sleep(max(0.0, sleep_for))
 
-            # Increase delay for next attempt (except decorrelated which already advanced)
-            if backoff_type == "exponential" and jitter != "decorrelated":
-                delay = min(max_delay, delay * backoff_factor)
-            # For fixed backoff, 'delay' stays at base_delay unless decorrelated changed it.
+                # Increase delay for next attempt (except decorrelated which already advanced)
+                if backoff_type == "exponential" and jitter != "decorrelated":
+                    delay = min(max_delay, delay * backoff_factor)
+                # For fixed backoff, 'delay' stays at base_delay unless decorrelated changed it.
 
-            attempt += 1
+                attempt += 1
 
-        try:
-            yield
-        finally:
             try:
-                self.pg_advisory_unlock(key)
-            except Exception:
-                pass
+                yield c
+            finally:
+                try:
+                    self.pg_advisory_unlock(key, conn=c)
+                except Exception:
+                    pass
 
     def _logical_slot_changes(
         self,
@@ -1177,11 +1211,14 @@ class Base(object):
         statement: sa.sql.Select,
         label: t.Optional[str] = None,
         literal_binds: bool = False,
+        conn: t.Optional[sa.engine.Connection] = None,
     ) -> sa.engine.Row:
         """Fetch one row query."""
         if self.verbose:
             compiled_query(statement, label=label, literal_binds=literal_binds)
 
+        if conn is not None:
+            return conn.execute(statement).fetchone()
         with self.engine.connect() as conn:
             return conn.execute(statement).fetchone()
 

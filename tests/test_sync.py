@@ -19,7 +19,7 @@ from pgsync.exc import (
     SchemaError,
 )
 from pgsync.node import Node
-from pgsync.settings import IS_MYSQL_COMPAT
+from pgsync.settings import IS_MYSQL_COMPAT, REDIS_CHECKPOINT
 from pgsync.singleton import Singleton
 from pgsync.sync import settings, Sync
 
@@ -591,8 +591,7 @@ class TestSync(object):
                 assert mock_sys.stdout.write.call_count == 4
                 assert mock_sys.stdout.write.call_args_list == [
                     call(
-                        'Missing index on table "publisher" for '
-                        "columns: ['id']\n"
+                        "Missing index on table \"publisher\" for columns: ['id']\n"
                     ),
                     call(
                         'Create one with: "\x1b[4mCREATE INDEX '
@@ -826,18 +825,22 @@ class TestSync(object):
         )
 
     def test_checkpoint(self, sync):
-        os.unlink(sync.checkpoint_file)
-        assert os.path.exists(sync.checkpoint_file) is False
-        sync.checkpoint = 1234
-        with open(sync.checkpoint_file, "r") as fp:
-            value: int = int(fp.read().split()[0])
-            assert value == 1234
+        with override_env_var(JOIN_QUERIES="False", REDIS_CHECKPOINT="False"):
+            importlib.reload(settings)
 
-        with pytest.raises(TypeError) as excinfo:
-            sync.checkpoint = None
-            assert "Cannot assign a None value to checkpoint" == str(
-                excinfo.value
-            )
+            if os.path.exists(sync.checkpoint_file):
+                os.unlink(sync.checkpoint_file)
+            assert os.path.exists(sync.checkpoint_file) is False
+            sync.checkpoint = 1234
+            with open(sync.checkpoint_file, "r") as fp:
+                value: int = int(fp.read().split()[0])
+                assert value == 1234
+
+            with pytest.raises(TypeError) as excinfo:
+                sync.checkpoint = None
+                assert "Cannot assign a None value to checkpoint" == str(
+                    excinfo.value
+                )
 
     def test__payload_data(self, sync):
         payload = Payload(
@@ -935,12 +938,12 @@ class TestSync(object):
                     )
                 mock_create_function.assert_called_once_with("public")
             mock_teardown.assert_called_once_with(
-                drop_view=False, polling=False, wal=False
+                drop_view=False, polling=False, wal=False, conn=ANY
             )
 
     @patch("pgsync.redisqueue.RedisQueue.delete")
     def test_teardown(self, mock_redis_delete, sync):
-        with override_env_var(JOIN_QUERIES="False"):
+        with override_env_var(JOIN_QUERIES="False", REDIS_CHECKPOINT="False"):
             importlib.reload(settings)
 
             with patch("pgsync.sync.Base.drop_function") as mock_drop_function:
