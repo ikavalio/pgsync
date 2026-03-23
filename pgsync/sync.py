@@ -325,7 +325,11 @@ class Sync(Base, metaclass=Singleton):
         )
 
     def setup(
-        self, no_create: bool = False, polling: bool = False, wal: bool = False
+        self,
+        no_create: bool = False,
+        polling: bool = False,
+        wal: bool = False,
+        keep_state: bool = False,
     ) -> None:
         """Create the database triggers and replication slot.
         Generally bootstrap should not require Redis as it is optional in certain cases.
@@ -342,9 +346,23 @@ class Sync(Base, metaclass=Singleton):
         with self.advisory_lock(
             self.database, max_retries=None, retry_interval=0.1
         ):
-            if if_not_exists:
+            if if_not_exists and not keep_state:
+                try:
+                    os.unlink(self.checkpoint_file)
+                except (OSError, FileNotFoundError):
+                    logger.warning(
+                        f"Checkpoint file not found: {self.checkpoint_file}"
+                    )
 
-                self.teardown(drop_view=False, polling=polling, wal=wal)
+                if not wal:
+                    try:
+                        if self.redis is None:
+                            raise RuntimeError("Redis is not configured.")
+                        self.redis.delete()
+                    except Exception as e:
+                        logger.warning(
+                            f"Could not clear Redis checkpoint queue: {e}"
+                        )
 
             if not polling and not wal:
                 for schema in self.schemas:
@@ -424,8 +442,7 @@ class Sync(Base, metaclass=Singleton):
                         )
 
             if not polling:
-                if if_not_exists or not self.replication_slots(self.__name):
-
+                if if_not_exists and not self.replication_slots(self.__name):
                     self.create_replication_slot(self.__name)
 
     def teardown(
@@ -452,7 +469,7 @@ class Sync(Base, metaclass=Singleton):
                     f"Checkpoint file not found: {self.checkpoint_file}"
                 )
 
-            if not wal and not settings.REDIS_CHECKPOINT:
+            if not wal:
                 try:
                     if self.redis is None:
                         raise RuntimeError("Redis is not configured.")

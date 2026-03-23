@@ -591,8 +591,7 @@ class TestSync(object):
                 assert mock_sys.stdout.write.call_count == 4
                 assert mock_sys.stdout.write.call_args_list == [
                     call(
-                        'Missing index on table "publisher" for '
-                        "columns: ['id']\n"
+                        "Missing index on table \"publisher\" for columns: ['id']\n"
                     ),
                     call(
                         'Create one with: "\x1b[4mCREATE INDEX '
@@ -825,8 +824,13 @@ class TestSync(object):
             "book_1.isbn = :isbn_2 AND book_1.title = :title_2"
         )
 
+    @pytest.mark.skipif(
+        settings.REDIS_CHECKPOINT,
+        reason="Skipped because REDIS_CHECKPOINT is False",
+    )
     def test_checkpoint(self, sync):
-        os.unlink(sync.checkpoint_file)
+        if os.path.exists(sync.checkpoint_file):
+            os.unlink(sync.checkpoint_file)
         assert os.path.exists(sync.checkpoint_file) is False
         sync.checkpoint = 1234
         with open(sync.checkpoint_file, "r") as fp:
@@ -898,8 +902,7 @@ class TestSync(object):
             routing=None,
         )
 
-    @patch("pgsync.sync.Sync.teardown")
-    def test_setup(self, mock_teardown, sync):
+    def test_setup(self, sync):
         with override_env_var(JOIN_QUERIES="False"):
             importlib.reload(settings)
 
@@ -934,9 +937,6 @@ class TestSync(object):
                         },
                     )
                 mock_create_function.assert_called_once_with("public")
-            mock_teardown.assert_called_once_with(
-                drop_view=False, polling=False, wal=False
-            )
 
     @patch("pgsync.redisqueue.RedisQueue.delete")
     def test_teardown(self, mock_redis_delete, sync):

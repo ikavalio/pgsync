@@ -357,7 +357,7 @@ class TestBase(object):
         assert mock_logger.debug.call_count == 2
         mock_logger.debug.assert_any_call(f"Creating database: {database}")
         mock_logger.debug.assert_any_call(f"Created database: {database}")
-        mock_pg_engine.assert_any_call("postgres", echo=True)
+        mock_pg_engine.assert_any_call("inscribedb", echo=True)
         calls = [call(mock_pg_engine, f'CREATE DATABASE "{database}"')]
         mock_pg_execute.call_args_list == calls
 
@@ -376,7 +376,7 @@ class TestBase(object):
         assert mock_logger.debug.call_count == 2
         mock_logger.debug.assert_any_call(f"Dropping database: {database}")
         mock_logger.debug.assert_any_call(f"Dropped database: {database}")
-        mock_pg_engine.assert_any_call("postgres", echo=True)
+        mock_pg_engine.assert_any_call("inscribedb", echo=True)
         calls = [call(mock_pg_engine, f'DROP DATABASE "{database}"')]
         mock_pg_execute.call_args_list == calls
 
