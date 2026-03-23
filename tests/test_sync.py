@@ -916,10 +916,14 @@ class TestSync(object):
                         with patch(
                             "pgsync.sync.Base.create_replication_slot"
                         ) as mock_create_replication_slot:
-                            sync.setup()
-                            mock_create_replication_slot.assert_called_once_with(
-                                "testdb_testdb"
-                            )
+                            with patch(
+                                "pgsync.sync.Base.replication_slots",
+                                return_value=[],
+                            ):
+                                sync.setup()
+                                mock_create_replication_slot.assert_called_once_with(
+                                    "testdb_testdb"
+                                )
                         mock_create_triggers.assert_called_once_with(
                             "public",
                             tables={"publisher", "book"},
