@@ -412,11 +412,6 @@ def create_view(
                 rows[table_name]["indices"] = set(indices)
             if columns:
                 rows[table_name]["columns"] = set(columns)
-        with engine.connect().execution_options(
-            isolation_level="AUTOCOMMIT"
-        ) as conn:
-            conn.execute(DropView(schema, MATERIALIZED_VIEW))
-
     if schema != DEFAULT_SCHEMA:
         for table in set(tables):
             tables.add(f"{schema}.{table}")
@@ -535,19 +530,20 @@ def create_view(
         .alias("t")
     )
     logger.debug(f"Creating view: {schema}.{MATERIALIZED_VIEW}")
-    with engine.connect().execution_options(
-        isolation_level="AUTOCOMMIT"
-    ) as conn:
-        conn.execute(CreateView(schema, MATERIALIZED_VIEW, statement))
-        conn.execute(DropIndex("_idx"))
-        conn.execute(
-            CreateIndex(
-                "_idx",
-                schema,
-                MATERIALIZED_VIEW,
-                ["table_name"],
+    with engine.connect() as conn:
+        with conn.begin():
+            if MATERIALIZED_VIEW in views:
+                conn.execute(DropView(schema, MATERIALIZED_VIEW))
+            conn.execute(CreateView(schema, MATERIALIZED_VIEW, statement))
+            conn.execute(DropIndex("_idx"))
+            conn.execute(
+                CreateIndex(
+                    "_idx",
+                    schema,
+                    MATERIALIZED_VIEW,
+                    ["table_name"],
+                )
             )
-        )
     logger.debug(f"Created view: {schema}.{MATERIALIZED_VIEW}")
 
 

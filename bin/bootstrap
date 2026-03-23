@@ -66,6 +66,13 @@ logger = logging.getLogger(__name__)
     ),
     default=False,
 )
+@click.option(
+    "--keep-state",
+    "-ks",
+    is_flag=True,
+    help="Preserve checkpoint and Redis queue state across bootstrap",
+    default=False,
+)
 @click.option("--user", "-u", help="PG_USER override")
 @click.option(
     "--verbose",
@@ -85,6 +92,7 @@ def main(
     port: int,
     verbose: bool,
     no_create: bool = False,
+    keep_state: bool = False,
 ) -> None:
     """Application onetime bootstrap."""
     kwargs: dict = {
@@ -128,7 +136,7 @@ def main(
         if teardown:
             sync.teardown()
             continue
-        sync.setup(no_create=no_create)
+        sync.setup(no_create=no_create, keep_state=keep_state)
         logger.info(f"Bootstrap: {sync.database}")
 
 

@@ -827,7 +827,6 @@ class TestSync(object):
     def test_checkpoint(self, sync):
         with override_env_var(JOIN_QUERIES="False", REDIS_CHECKPOINT="False"):
             importlib.reload(settings)
-
             if os.path.exists(sync.checkpoint_file):
                 os.unlink(sync.checkpoint_file)
             assert os.path.exists(sync.checkpoint_file) is False
@@ -901,8 +900,7 @@ class TestSync(object):
             routing=None,
         )
 
-    @patch("pgsync.sync.Sync.teardown")
-    def test_setup(self, mock_teardown, sync):
+    def test_setup(self, sync):
         with override_env_var(JOIN_QUERIES="False"):
             importlib.reload(settings)
 
@@ -916,10 +914,14 @@ class TestSync(object):
                         with patch(
                             "pgsync.sync.Base.create_replication_slot"
                         ) as mock_create_replication_slot:
-                            sync.setup()
-                            mock_create_replication_slot.assert_called_once_with(
-                                "testdb_testdb"
-                            )
+                            with patch(
+                                "pgsync.sync.Base.replication_slots",
+                                return_value=[],
+                            ):
+                                sync.setup()
+                                mock_create_replication_slot.assert_called_once_with(
+                                    "testdb_testdb"
+                                )
                         mock_create_triggers.assert_called_once_with(
                             "public",
                             tables={"publisher", "book"},
@@ -937,9 +939,6 @@ class TestSync(object):
                         },
                     )
                 mock_create_function.assert_called_once_with("public")
-            mock_teardown.assert_called_once_with(
-                drop_view=False, polling=False, wal=False, conn=ANY
-            )
 
     @patch("pgsync.redisqueue.RedisQueue.delete")
     def test_teardown(self, mock_redis_delete, sync):
