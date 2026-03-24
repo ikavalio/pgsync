@@ -299,12 +299,11 @@ class Sync(Base, metaclass=Singleton):
             else:
                 columns = foreign_keys.get(node.name, [])
                 sys.stdout.write(
-                    f'Missing index on table "{node.table}" for columns: '
-                    f"{columns}\n"
+                    f'Missing index on table "{node.table}" for columns: {columns}\n'
                 )
                 query: str = sqlparse.format(
-                    f'CREATE INDEX idx_{node.table}_{"_".join(columns)} ON '
-                    f'{node.table} ({", ".join(columns)})',
+                    f"CREATE INDEX idx_{node.table}_{'_'.join(columns)} ON "
+                    f"{node.table} ({', '.join(columns)})",
                     reindent=True,
                     keyword_case="upper",
                 )
@@ -374,7 +373,6 @@ class Sync(Base, metaclass=Singleton):
 
                     # TODO: move if_not_exists to the function
                     if if_not_exists or not self.function_exists(schema):
-
                         self.create_function(schema)
 
                     tables: t.Set = set()
@@ -566,7 +564,6 @@ class Sync(Base, metaclass=Singleton):
         TODO: We can also process all INSERTS together and rearrange
         them as done below
         """
-        offset: int = 0
         limit: int = (
             logical_slot_chunk_size or settings.LOGICAL_SLOT_CHUNK_SIZE
         )
@@ -578,22 +575,30 @@ class Sync(Base, metaclass=Singleton):
             upto_lsn=upto_lsn,
         )
         while True:
-            # peek one page of up to limit rows
+            # peek one chunk; no OFFSET - each advance moves the slot forward
             raw: t.List[sa.engine.row.Row] = self.logical_slot_peek_changes(
                 slot_name=self.__name,
-                txmin=txmin,
-                txmax=txmax,
                 upto_lsn=upto_lsn,
-                limit=limit,
-                offset=offset,
+                upto_nchanges=limit,
             )
             if not raw:
                 break
-            offset += limit
 
-            # parse and filter out BEGIN/COMMIT and unwanted schemas
+            # respect txmax: don't advance past rows with xid >= txmax
+            if txmax is not None:
+                advanceable = [r for r in raw if int(str(r.xid)) < txmax]
+                if not advanceable:
+                    break
+            else:
+                advanceable = raw
+
+            last_lsn: str = advanceable[-1].lsn
+
+            # parse and filter out BEGIN/COMMIT, pre-txmin rows, and unwanted schemas
             payloads: t.List[Payload] = []
-            for row in raw:
+            for row in advanceable:
+                if txmin is not None and int(str(row.xid)) < txmin:
+                    continue
                 if TX_BOUNDARY_RE.match(row.data):
                     continue
                 try:
@@ -617,13 +622,9 @@ class Sync(Base, metaclass=Singleton):
                     self.search_client.bulk(self.index, self._payloads(batch))
                     self.count["xlog"] += len(batch)
 
-        # mark those rows consumed
-        self.logical_slot_get_changes(
-            slot_name=self.__name,
-            txmin=txmin,
-            txmax=txmax,
-            upto_lsn=upto_lsn,
-        )
+            # advance the slot without decoding WAL (pg_replication_slot_advance)
+            self.logical_slot_advance(self.__name, last_lsn)
+
         self.checkpoint = txmax or self.txid_current
 
     def _xlog_progress(self, current: int, total: t.Optional[int]) -> None:
@@ -1037,7 +1038,6 @@ class Sync(Base, metaclass=Singleton):
         self, node: Node, filters: dict, payloads: t.List[Payload]
     ) -> dict:
         if node.is_through:
-
             # handle case where we insert into a through table
             # set the parent as the new entity that has changed
             foreign_keys = self.query_builder.get_foreign_keys(
@@ -1741,7 +1741,6 @@ class Sync(Base, metaclass=Singleton):
                     payloads = []
                 notification: t.AnyStr = conn.notifies.pop(0)
                 if notification.channel == self.database:
-
                     try:
                         payload = json.loads(notification.payload)
                     except json.JSONDecodeError as e:

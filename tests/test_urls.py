@@ -18,7 +18,10 @@ class TestUrls(object):
     """URLS tests."""
 
     @patch("pgsync.urls.logger")
-    def test_get_search_url(self, mock_logger):
+    @patch("pgsync.urls.ELASTICSEARCH_USER", None)
+    @patch("pgsync.urls.ELASTICSEARCH_PASSWORD", None)
+    @patch("pgsync.urls._get_auth", return_value=None)
+    def test_get_search_url(self, mock_get_auth, mock_logger):
         assert (
             get_search_url(scheme="https")
             == f"https://localhost:{ELASTICSEARCH_PORT}"
@@ -67,6 +70,8 @@ class TestUrls(object):
         #     )
 
     @patch("pgsync.urls.logger")
+    @patch("pgsync.urls.REDIS_USER", None)
+    @patch("pgsync.urls.REDIS_AUTH", None)
     def test_get_redis_url(self, mock_logger):
         assert get_redis_url() == "redis://localhost:6379/0"
         mock_logger.debug.assert_called_with(

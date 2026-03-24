@@ -709,6 +709,7 @@ class Base(object):
         """
         filters: list = []
         statement: sa.sql.Select = sa.select(
+            sa.text("lsn"),
             sa.text("xid"),
             sa.text("data"),
         ).select_from(
@@ -834,6 +835,21 @@ class Base(object):
             return conn.execute(
                 statement.with_only_columns(*[sa.func.COUNT()])
             ).scalar()
+
+    def logical_slot_advance(self, slot_name: str, upto_lsn: str) -> None:
+        """Advance a replication slot to upto_lsn without decoding WAL.
+
+        Uses pg_replication_slot_advance() which is a metadata-only operation
+        and does not decode any WAL records (PostgreSQL 11+).
+        """
+        with self.advisory_lock(
+            slot_name, max_retries=None, retry_interval=0.1
+        ):
+            self.execute(
+                sa.select(sa.text("*")).select_from(
+                    sa.func.PG_REPLICATION_SLOT_ADVANCE(slot_name, upto_lsn)
+                )
+            )
 
     # Views...
 

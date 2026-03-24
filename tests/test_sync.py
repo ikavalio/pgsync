@@ -25,7 +25,7 @@ from pgsync.sync import settings, Sync
 
 from .testing_utils import override_env_var
 
-ROW = namedtuple("Row", ["data", "xid"])
+ROW = namedtuple("Row", ["data", "xid", "lsn"], defaults=["0/0"])
 
 
 @pytest.fixture(scope="function")
@@ -84,54 +84,54 @@ class TestSync(object):
                 [ROW("BEGIN 72736", 1234)],
                 [],
             ]
-            with patch("pgsync.sync.Sync.sync") as mock_sync:
-                sync.logical_slot_changes()
-                assert mock_peek.call_args_list == [
-                    call(
-                        slot_name="testdb_testdb",
-                        txmin=None,
-                        txmax=None,
-                        upto_lsn=None,
-                        limit=5000,
-                        offset=0,
-                    ),
-                    call(
-                        slot_name="testdb_testdb",
-                        txmin=None,
-                        txmax=None,
-                        upto_lsn=None,
-                        limit=5000,
-                        offset=5000,
-                    ),
-                ]
-                mock_sync.assert_not_called()
+            with patch(
+                "pgsync.sync.Sync.logical_slot_advance"
+            ) as mock_advance:
+                with patch("pgsync.sync.Sync.sync") as mock_sync:
+                    sync.logical_slot_changes()
+                    assert mock_peek.call_args_list == [
+                        call(
+                            slot_name="testdb_testdb",
+                            upto_lsn=None,
+                            upto_nchanges=5000,
+                        ),
+                        call(
+                            slot_name="testdb_testdb",
+                            upto_lsn=None,
+                            upto_nchanges=5000,
+                        ),
+                    ]
+                    mock_advance.assert_called_once_with(
+                        "testdb_testdb", "0/0"
+                    )
+                    mock_sync.assert_not_called()
 
         with patch("pgsync.sync.Sync.logical_slot_peek_changes") as mock_peek:
             mock_peek.side_effect = [
                 [ROW("COMMIT 72736", 1234)],
                 [],
             ]
-            with patch("pgsync.sync.Sync.sync") as mock_sync:
-                sync.logical_slot_changes()
-                assert mock_peek.call_args_list == [
-                    call(
-                        slot_name="testdb_testdb",
-                        txmin=None,
-                        txmax=None,
-                        upto_lsn=None,
-                        limit=5000,
-                        offset=0,
-                    ),
-                    call(
-                        slot_name="testdb_testdb",
-                        txmin=None,
-                        txmax=None,
-                        upto_lsn=None,
-                        limit=5000,
-                        offset=5000,
-                    ),
-                ]
-                mock_sync.assert_not_called()
+            with patch(
+                "pgsync.sync.Sync.logical_slot_advance"
+            ) as mock_advance:
+                with patch("pgsync.sync.Sync.sync") as mock_sync:
+                    sync.logical_slot_changes()
+                    assert mock_peek.call_args_list == [
+                        call(
+                            slot_name="testdb_testdb",
+                            upto_lsn=None,
+                            upto_nchanges=5000,
+                        ),
+                        call(
+                            slot_name="testdb_testdb",
+                            upto_lsn=None,
+                            upto_nchanges=5000,
+                        ),
+                    ]
+                    mock_advance.assert_called_once_with(
+                        "testdb_testdb", "0/0"
+                    )
+                    mock_sync.assert_not_called()
 
         with patch("pgsync.sync.Sync.logical_slot_peek_changes") as mock_peek:
             mock_peek.side_effect = [
@@ -148,29 +148,25 @@ class TestSync(object):
             ]
 
             with patch(
-                "pgsync.sync.Sync.logical_slot_get_changes"
-            ) as mock_get:
+                "pgsync.sync.Sync.logical_slot_advance"
+            ) as mock_advance:
                 with patch("pgsync.sync.Sync.sync") as mock_sync:
                     sync.logical_slot_changes()
                     assert mock_peek.call_args_list == [
                         call(
                             slot_name="testdb_testdb",
-                            txmin=None,
-                            txmax=None,
                             upto_lsn=None,
-                            limit=5000,
-                            offset=0,
+                            upto_nchanges=5000,
                         ),
                         call(
                             slot_name="testdb_testdb",
-                            txmin=None,
-                            txmax=None,
                             upto_lsn=None,
-                            limit=5000,
-                            offset=5000,
+                            upto_nchanges=5000,
                         ),
                     ]
-                    mock_get.assert_called_once()
+                    mock_advance.assert_called_once_with(
+                        "testdb_testdb", "0/0"
+                    )
                     mock_sync.assert_called_once()
                     assert mock_logger.debug.call_args_list == [
                         call("op: INSERT tbl book - 1"),
@@ -195,14 +191,11 @@ class TestSync(object):
                 ]
 
                 with patch(
-                    "pgsync.sync.Sync.logical_slot_get_changes"
-                ) as mock_get:
-                    with patch(
-                        "pgsync.sync.Sync.parse_logical_slot",
-                        side_effect=Exception,
-                    ):
-                        with patch("pgsync.sync.Sync.sync") as mock_sync:
-                            sync.logical_slot_changes()
+                    "pgsync.sync.Sync.parse_logical_slot",
+                    side_effect=Exception,
+                ):
+                    with patch("pgsync.sync.Sync.sync") as mock_sync:
+                        sync.logical_slot_changes()
             assert "Error parsing row" in str(excinfo.value)
 
     @patch("pgsync.sync.SearchClient.bulk")
@@ -260,32 +253,32 @@ class TestSync(object):
                 ],
                 [],
             ]
-            with patch("pgsync.sync.Sync.sync") as mock_sync:
-                sync.logical_slot_changes()
-                assert mock_logical_slot_peek_changes.call_args_list == [
-                    call(
-                        slot_name="testdb_testdb",
-                        txmin=None,
-                        txmax=None,
-                        upto_lsn=None,
-                        limit=5000,
-                        offset=0,
-                    ),
-                    call(
-                        slot_name="testdb_testdb",
-                        txmin=None,
-                        txmax=None,
-                        upto_lsn=None,
-                        limit=5000,
-                        offset=5000,
-                    ),
-                ]
-                assert mock_logger.debug.call_args_list == [
-                    call("op: INSERT tbl book - 3"),
-                    call("op: UPDATE tbl book - 2"),
-                    call("op: INSERT tbl book - 2"),
-                ]
-                assert mock_search_client.call_count == 3
+            with patch(
+                "pgsync.sync.Sync.logical_slot_advance"
+            ) as mock_advance:
+                with patch("pgsync.sync.Sync.sync") as mock_sync:
+                    sync.logical_slot_changes()
+                    assert mock_logical_slot_peek_changes.call_args_list == [
+                        call(
+                            slot_name="testdb_testdb",
+                            upto_lsn=None,
+                            upto_nchanges=5000,
+                        ),
+                        call(
+                            slot_name="testdb_testdb",
+                            upto_lsn=None,
+                            upto_nchanges=5000,
+                        ),
+                    ]
+                    mock_advance.assert_called_once_with(
+                        "testdb_testdb", "0/0"
+                    )
+                    assert mock_logger.debug.call_args_list == [
+                        call("op: INSERT tbl book - 3"),
+                        call("op: UPDATE tbl book - 2"),
+                        call("op: INSERT tbl book - 2"),
+                    ]
+                    assert mock_search_client.call_count == 3
 
     @patch("pgsync.sync.SearchClient")
     def test_sync_validate(self, mock_search_client):
