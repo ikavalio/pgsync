@@ -299,12 +299,11 @@ class Sync(Base, metaclass=Singleton):
             else:
                 columns = foreign_keys.get(node.name, [])
                 sys.stdout.write(
-                    f'Missing index on table "{node.table}" for columns: '
-                    f"{columns}\n"
+                    f'Missing index on table "{node.table}" for columns: {columns}\n'
                 )
                 query: str = sqlparse.format(
-                    f'CREATE INDEX idx_{node.table}_{"_".join(columns)} ON '
-                    f'{node.table} ({", ".join(columns)})',
+                    f"CREATE INDEX idx_{node.table}_{'_'.join(columns)} ON "
+                    f"{node.table} ({', '.join(columns)})",
                     reindent=True,
                     keyword_case="upper",
                 )
@@ -373,7 +372,6 @@ class Sync(Base, metaclass=Singleton):
 
                     # TODO: move if_not_exists to the function
                     if if_not_exists or not self.function_exists(schema):
-
                         self.create_function(schema)
 
                     tables: t.Set = set()
@@ -529,9 +527,11 @@ class Sync(Base, metaclass=Singleton):
         filled: int = int(bar_length * current // total) if total else 0
         bar: str = "=" * filled + "-" * (bar_length - filled)
         timestamp = time.strftime("%Y-%m-%d %H:%M:%S")
+        prefix = "\r" if sys.stdout.isatty() else ""
+        end = "" if sys.stdout.isatty() else "\n"
         sys.stdout.write(
-            f"\r{timestamp} WAL {self.database}:{self.index} "
-            f"[{bar}] {format_number(current):>12}/{format_number(total):<12} ({percent:6.2f}%)"
+            f"{prefix}{timestamp} WAL {self.database}:{self.index} "
+            f"[{bar}] {format_number(current):>12}/{format_number(total):<12} ({percent:6.2f}%){end}"
         )
         sys.stdout.flush()
 
@@ -566,7 +566,6 @@ class Sync(Base, metaclass=Singleton):
         TODO: We can also process all INSERTS together and rearrange
         them as done below
         """
-        offset: int = 0
         limit: int = (
             logical_slot_chunk_size or settings.LOGICAL_SLOT_CHUNK_SIZE
         )
@@ -578,22 +577,33 @@ class Sync(Base, metaclass=Singleton):
             upto_lsn=upto_lsn,
         )
         while True:
-            # peek one page of up to limit rows
+            # peek one chunk; no OFFSET - each advance moves the slot forward
+            logger.debug(f"peek upto_lsn={upto_lsn!r} limit={limit}")
             raw: t.List[sa.engine.row.Row] = self.logical_slot_peek_changes(
                 slot_name=self.__name,
-                txmin=txmin,
-                txmax=txmax,
                 upto_lsn=upto_lsn,
-                limit=limit,
-                offset=offset,
+                upto_nchanges=limit,
             )
             if not raw:
                 break
-            offset += limit
 
-            # parse and filter out BEGIN/COMMIT and unwanted schemas
+            # pg_logical_slot_peek_changes emits records in commit order, not
+            # LSN order - a later-committed transaction's BEGIN may appear at
+            # a lower LSN than an earlier-committed transaction's COMMIT.
+            # However, peek always returns *complete* transactions (it will
+            # emit fewer rows rather than cut a transaction in half), so
+            # raw[-1] is always the COMMIT of the last-committed transaction,
+            # whose LSN is the highest in the batch.
+            last_lsn: str = raw[-1].lsn
+            logger.debug(f"batch last_lsn={last_lsn} rows={len(raw)}")
+
+            # parse and filter out BEGIN/COMMIT, pre-txmin rows, and unwanted schemas
             payloads: t.List[Payload] = []
             for row in raw:
+                if txmax is not None and int(str(row.xid)) >= txmax:
+                    continue
+                if txmin is not None and int(str(row.xid)) < txmin:
+                    continue
                 if TX_BOUNDARY_RE.match(row.data):
                     continue
                 try:
@@ -617,13 +627,20 @@ class Sync(Base, metaclass=Singleton):
                     self.search_client.bulk(self.index, self._payloads(batch))
                     self.count["xlog"] += len(batch)
 
-        # mark those rows consumed
-        self.logical_slot_get_changes(
-            slot_name=self.__name,
-            txmin=txmin,
-            txmax=txmax,
-            upto_lsn=upto_lsn,
+            # advance the slot without decoding WAL (pg_replication_slot_advance)
+            end_lsn = self.logical_slot_advance(self.__name, last_lsn)
+            logger.debug(
+                f"slot advance: requested={last_lsn} end_lsn={end_lsn}"
+            )
+
+        # Advance confirmed_flush_lsn all the way to the target LSN once the
+        # slot is fully drained, matching the old pg_logical_slot_get_changes behavior.
+        final_lsn = upto_lsn or self.current_wal_lsn
+        end_lsn = self.logical_slot_advance(self.__name, final_lsn)
+        logger.debug(
+            f"slot final advance: requested={final_lsn} end_lsn={end_lsn}"
         )
+
         self.checkpoint = txmax or self.txid_current
 
     def _xlog_progress(self, current: int, total: t.Optional[int]) -> None:
@@ -1037,7 +1054,6 @@ class Sync(Base, metaclass=Singleton):
         self, node: Node, filters: dict, payloads: t.List[Payload]
     ) -> dict:
         if node.is_through:
-
             # handle case where we insert into a through table
             # set the parent as the new entity that has changed
             foreign_keys = self.query_builder.get_foreign_keys(
@@ -1741,7 +1757,6 @@ class Sync(Base, metaclass=Singleton):
                     payloads = []
                 notification: t.AnyStr = conn.notifies.pop(0)
                 if notification.channel == self.database:
-
                     try:
                         payload = json.loads(notification.payload)
                     except json.JSONDecodeError as e:

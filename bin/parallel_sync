@@ -104,7 +104,8 @@ def logical_slot_changes(
     sync: Sync = Sync(doc, verbose=verbose, validate=validate)
     txmin: int = sync.checkpoint
     txmax: int = sync.txid_current
-    sync.logical_slot_changes(txmin=txmin, txmax=txmax)
+    upto_lsn: str = sync.current_wal_lsn
+    sync.logical_slot_changes(txmin=txmin, txmax=txmax, upto_lsn=upto_lsn)
     sync.checkpoint = txmax or sync.txid_current
 
 

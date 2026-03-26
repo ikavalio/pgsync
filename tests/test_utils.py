@@ -103,6 +103,10 @@ class TestUtils(object):
         }
 
     @patch("pgsync.utils.logger")
+    @patch("pgsync.urls.ELASTICSEARCH_USER", None)
+    @patch("pgsync.urls.ELASTICSEARCH_PASSWORD", None)
+    @patch("pgsync.urls.REDIS_USER", None)
+    @patch("pgsync.urls.REDIS_AUTH", None)
     def test_show_settings(self, mock_logger):
         show_settings(config="tests/fixtures/schema.json")
         search_backend = (
@@ -170,8 +174,7 @@ class TestUtils(object):
         statement = sa.select(*[model.c.isbn]).select_from(model)
         compiled_query(statement, label="foo", literal_binds=True)
         mock_logger.debug.assert_called_once_with(
-            f"\x1b[4mfoo:\x1b[0m\nSELECT book_1.isbn\n"
-            f"FROM {self.schema}.book AS book_1"
+            f"\x1b[4mfoo:\x1b[0m\nSELECT book_1.isbn\nFROM {self.schema}.book AS book_1"
         )
         assert mock_sys.stdout.write.call_count == 3
 
