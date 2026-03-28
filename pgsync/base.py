@@ -785,6 +785,21 @@ class Base(object):
             )
         )[0]
 
+    def txmax_and_lsn(self) -> t.Tuple[int, str]:
+        """Atomically capture txid_current and pg_current_wal_lsn in one round-trip.
+
+        Using a single query ensures every transaction with xid < txmax has its
+        commit LSN <= upto_lsn, so no committed changes fall in the gap between
+        the two values and get advanced over in the slot without being processed.
+        """
+        row = self.fetchone(
+            sa.select(
+                sa.func.TXID_CURRENT(),
+                sa.func.PG_CURRENT_WAL_LSN(),
+            )
+        )
+        return int(row[0]), str(row[1])
+
     def logical_slot_get_changes(
         self,
         slot_name: str,

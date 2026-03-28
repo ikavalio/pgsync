@@ -119,6 +119,10 @@ class Sync(Base, metaclass=Singleton):
         self._checkpoint: t.Optional[t.Union[str, int]] = None
         self._plugins: Plugins = None
         self._truncate: bool = False
+        # LSN up to which all NOTIFYs have been durably pushed to Redis.
+        # Maintained by poll_db; read by _truncate_slots to bound slot advancement.
+        self._safe_lsn: t.Optional[str] = None
+        self._safe_lsn_lock: threading.Lock = threading.Lock()
         self.producer: bool = producer
         self.consumer: bool = consumer
         self.num_workers: int = num_workers
@@ -1717,7 +1721,10 @@ class Sync(Base, metaclass=Singleton):
 
     @threaded
     @exception
-    def poll_db(self) -> None:
+    def poll_db(
+        self,
+        listen_established: t.Optional[threading.Event] = None,
+    ) -> None:
         """
         Producer which polls Postgres continuously.
 
@@ -1730,7 +1737,24 @@ class Sync(Base, metaclass=Singleton):
         logger.debug(
             f'Listening to notifications on channel "{self.database}"'
         )
+        if listen_established is not None:
+            listen_established.set()
         payloads: list = []
+
+        def _push_and_mark_safe(batch: list) -> None:
+            """Push batch to Redis then record the current WAL LSN as safe to truncate up to."""
+            self.redis.push(batch)
+            # After a successful push every transaction in `batch` has its NOTIFY
+            # durably in Redis. The current WAL position is >= the commit LSN of
+            # all those transactions (they committed before their NOTIFYs fired,
+            # which happened before we pushed). Recording this LSN lets
+            # _truncate_slots advance confirmed_flush_lsn only as far as we have
+            # confirmed Redis durability, eliminating the race where slot
+            # advancement could consume a commit whose NOTIFY hasn't reached
+            # Redis yet.
+            lsn: str = self.current_wal_lsn()
+            with self._safe_lsn_lock:
+                self._safe_lsn = lsn
 
         while True:
             # NB: consider reducing POLL_TIMEOUT to increase throughput
@@ -1741,7 +1765,7 @@ class Sync(Base, metaclass=Singleton):
             ):
                 # Catch any hanging items from the last poll
                 if payloads:
-                    self.redis.push(payloads)
+                    _push_and_mark_safe(payloads)
                     payloads = []
                 continue
 
@@ -1753,7 +1777,7 @@ class Sync(Base, metaclass=Singleton):
 
             while conn.notifies:
                 if len(payloads) >= settings.REDIS_WRITE_CHUNK_SIZE:
-                    self.redis.push(payloads)
+                    _push_and_mark_safe(payloads)
                     payloads = []
                 notification: t.AnyStr = conn.notifies.pop(0)
                 if notification.channel == self.database:
@@ -1885,9 +1909,14 @@ class Sync(Base, metaclass=Singleton):
                     _payloads: list = []
 
         txids: t.Set = set(map(lambda x: x.xmin, payloads))
-        # for truncate, tg_op txids is None so skip setting the checkpoint
-        if txids != set([None]):
-            self.checkpoint: int = min(min(txids), self.txid_current) - 1
+        # Advance checkpoint only when we have real xmin values (no TRUNCATE),
+        # never regress it (pull() may have set a higher value from txmax),
+        # and avoid a separate txid_current() round-trip (race condition).
+        if txids != {None}:
+            new_checkpoint = min(txids) - 1
+            current = self.checkpoint
+            if current is None or new_checkpoint > current:
+                self.checkpoint = new_checkpoint
 
     def pull(self, polling: bool = False) -> None:
         """Pull data from db."""
@@ -1907,13 +1936,24 @@ class Sync(Base, metaclass=Singleton):
             )
         else:
             txmin = self.checkpoint
-            txmax = self.txid_current
-            logger.debug(f"pull txmin: {txmin} - txmax: {txmax}")
+            # Capture txmax and upto_lsn atomically in one round-trip so that
+            # every transaction with xid < txmax has commit LSN <= upto_lsn.
+            # If sampled separately (txmax first, then upto_lsn after sync()),
+            # transactions committing in between get their WAL advanced over
+            # without being processed, permanently losing their deletes.
+            txmax, upto_lsn = self.txmax_and_lsn()
+            logger.debug(
+                f"pull txmin: {txmin} - txmax: {txmax} upto_lsn: {upto_lsn}"
+            )
 
-        # forward pass sync
-        self.search_client.bulk(
-            self.index, self.sync(txmin=txmin, txmax=txmax)
-        )
+        # On bootstrap (txmin is None) do a full table scan to seed the index.
+        # On restart (txmin is not None) skip it: the WAL slot is intact and
+        # contains every insert/update/delete since confirmed_flush_lsn, so
+        # an O(total-rows) sequential xmin scan would be pure wasted work.
+        if txmin is None:
+            self.search_client.bulk(
+                self.index, self.sync(txmin=txmin, txmax=txmax)
+            )
 
         if self.is_mysql_compat:
             self.binlog_changes(
@@ -1922,8 +1962,6 @@ class Sync(Base, metaclass=Singleton):
                 binlog_chunk_size=chunk_size,
             )
         else:
-            # this is the max lsn we should go upto
-            upto_lsn: str = self.current_wal_lsn
             try:
                 # now sync up to txmax to capture everything we may have missed
                 self.logical_slot_changes(
@@ -1938,6 +1976,14 @@ class Sync(Base, metaclass=Singleton):
                     return
                 else:
                     raise
+            # Advance the checkpoint to txmax so that on restart we resume
+            # exactly from here.  txmax was captured atomically with upto_lsn,
+            # guaranteeing every transaction with xid < txmax has its WAL
+            # commit record at or before upto_lsn and has just been processed.
+            # Using txmax (not min(notify_xids)) eliminates the race where
+            # on_publish could advance the checkpoint past in-flight Redis
+            # events whose WAL entries would then be skipped.
+            self.checkpoint = txmax
 
         self._truncate = True
 
@@ -2053,8 +2099,16 @@ class Sync(Base, metaclass=Singleton):
 
     def _truncate_slots(self) -> None:
         if self._truncate:
-            logger.debug(f"Truncating replication slot: {self.__name}")
-            self.logical_slot_get_changes(self.__name, upto_nchanges=None)
+            with self._safe_lsn_lock:
+                safe_lsn = self._safe_lsn
+            if safe_lsn is None:
+                # poll_db hasn't pushed anything to Redis yet; nothing is safe
+                # to confirm, so skip this cycle.
+                return
+            logger.debug(
+                f"Truncating replication slot: {self.__name} upto_lsn={safe_lsn}"
+            )
+            self.logical_slot_advance(self.__name, safe_lsn)
 
     @threaded
     @exception
@@ -2112,7 +2166,13 @@ class Sync(Base, metaclass=Singleton):
         else:
             # sync up to and produce items in the Redis/Valkey cache
             if self.producer:
-                self.poll_db()
+                # Start LISTEN first, then wait for it to be active before
+                # sampling upto_lsn in pull().  This closes the gap where
+                # transactions committing between the two could fire NOTIFYs
+                # that nobody hears while also being past the WAL window.
+                listen_established: threading.Event = threading.Event()
+                self.poll_db(listen_established=listen_established)
+                listen_established.wait()
                 # sync up to current transaction_id
                 self.pull()
 

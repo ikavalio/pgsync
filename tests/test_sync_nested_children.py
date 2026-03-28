@@ -962,7 +962,9 @@ class TestNestedChildren(object):
         def poll_redis():
             return []
 
-        def poll_db():
+        def poll_db(**kwargs):
+            if (e := kwargs.get("listen_established")) is not None:
+                e.set()
             with subtransactions(session):
                 session.execute(
                     book_shelf_cls.__table__.delete().where(
@@ -1229,7 +1231,9 @@ class TestNestedChildren(object):
         def poll_redis():
             return []
 
-        def poll_db():
+        def poll_db(**kwargs):
+            if (e := kwargs.get("listen_established")) is not None:
+                e.set()
             with subtransactions(session):
                 session.execute(
                     book_group_cls.__table__.insert().values(
@@ -2381,7 +2385,9 @@ class TestNestedChildren(object):
         def poll_redis():
             return []
 
-        def poll_db():
+        def poll_db(**kwargs):
+            if (e := kwargs.get("listen_established")) is not None:
+                e.set()
             with subtransactions(session):
                 session.add(country)
 

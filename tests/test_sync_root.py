@@ -520,7 +520,9 @@ class TestRoot(object):
         def poll_redis():
             return []
 
-        def poll_db():
+        def poll_db(**kwargs):
+            if (e := kwargs.get("listen_established")) is not None:
+                e.set()
             with subtransactions(session):
                 session.execute(
                     book_cls.__table__.update()
@@ -753,7 +755,9 @@ class TestRoot(object):
         def poll_redis():
             return []
 
-        def poll_db():
+        def poll_db(**kwargs):
+            if (e := kwargs.get("listen_established")) is not None:
+                e.set()
             with subtransactions(session):
                 session.execute(
                     book_cls.__table__.update()
@@ -840,7 +844,9 @@ class TestRoot(object):
         def poll_redis():
             return []
 
-        def poll_db():
+        def poll_db(**kwargs):
+            if (e := kwargs.get("listen_established")) is not None:
+                e.set()
             with subtransactions(session):
                 session.execute(
                     book_cls.__table__.delete().where(

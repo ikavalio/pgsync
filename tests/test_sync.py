@@ -8,7 +8,7 @@ from types import SimpleNamespace
 from unittest.mock import Mock
 
 import pytest
-from mock import ANY, call, patch
+from mock import ANY, call, MagicMock, patch, PropertyMock
 
 from pgsync.base import Base, Payload
 from pgsync.exc import (
@@ -173,10 +173,16 @@ class TestSync(object):
                     ]
                     mock_sync.assert_called_once()
                     assert mock_logger.debug.call_args_list == [
+                        call(
+                            ANY
+                        ),  # peek upto_lsn=None limit=5000 (iteration 1)
                         call(ANY),  # batch last_lsn=... rows=...
                         call("op: INSERT tbl book - 1"),
                         call("tg_op: INSERT table: public.book"),
                         call(ANY),  # slot advance: requested=...
+                        call(
+                            ANY
+                        ),  # peek upto_lsn=None limit=5000 (iteration 2)
                         call(ANY),  # slot final advance: requested=...
                     ]
 
@@ -338,11 +344,17 @@ class TestSync(object):
                         call("testdb_testdb", ANY),
                     ]
                     assert mock_logger.debug.call_args_list == [
+                        call(
+                            ANY
+                        ),  # peek upto_lsn=None limit=5000 (iteration 1)
                         call(ANY),  # batch last_lsn=... rows=...
                         call("op: INSERT tbl book - 3"),
                         call("op: UPDATE tbl book - 2"),
                         call("op: INSERT tbl book - 2"),
                         call(ANY),  # slot advance: requested=...
+                        call(
+                            ANY
+                        ),  # peek upto_lsn=None limit=5000 (iteration 2)
                         call(ANY),  # slot final advance: requested=...
                     ]
                     assert mock_search_client.call_count == 3
@@ -517,40 +529,85 @@ class TestSync(object):
 
     @patch("pgsync.sync.logger")
     def test_truncate_slots(self, mock_logger, sync):
+        safe_lsn = "0/AABBCCDD"
         with patch(
-            "pgsync.sync.Sync.logical_slot_get_changes"
-        ) as mock_logical_slot_changes:
+            "pgsync.sync.Sync.logical_slot_advance"
+        ) as mock_logical_slot_advance:
             sync._truncate = True
+            sync._safe_lsn = safe_lsn
             sync._truncate_slots()
-            mock_logical_slot_changes.assert_called_once_with(
-                "testdb_testdb", upto_nchanges=None
+            mock_logical_slot_advance.assert_called_once_with(
+                "testdb_testdb", safe_lsn
             )
             mock_logger.debug.assert_called_once_with(
-                "Truncating replication slot: testdb_testdb"
+                f"Truncating replication slot: testdb_testdb upto_lsn={safe_lsn}"
             )
 
     @patch("pgsync.sync.SearchClient.bulk")
     @patch("pgsync.sync.logger")
-    def test_pull(self, mock_logger, mock_es, sync):
-        with patch(
-            "pgsync.sync.Sync.logical_slot_changes"
-        ) as mock_logical_slot_changes:
-            sync.checkpoint = 1
+    def test_pull_restart(self, mock_logger, mock_es, sync):
+        """Restart (checkpoint present): skips table scan, WAL only."""
+        txmin = 1
+        txmax = 42
+        upto_lsn = "0/1234ABCD"
+        with (
+            patch(
+                "pgsync.sync.Sync.logical_slot_changes"
+            ) as mock_logical_slot_changes,
+            patch.object(
+                sync, "txmax_and_lsn", return_value=(txmax, upto_lsn)
+            ),
+        ):
+            sync.checkpoint = txmin
             sync.pull()
-            txmin = 1
-            txmax = sync.txid_current - 1
             mock_logical_slot_changes.assert_called_once_with(
                 txmin=txmin,
                 txmax=txmax,
                 logical_slot_chunk_size=settings.LOGICAL_SLOT_CHUNK_SIZE,
-                upto_lsn=ANY,
+                upto_lsn=upto_lsn,
             )
             mock_logger.debug.assert_called_once_with(
-                f"pull txmin: {txmin} - txmax: {txmax}"
+                f"pull txmin: {txmin} - txmax: {txmax} upto_lsn: {upto_lsn}"
             )
-            # assert sync.checkpoint == txmax
             assert sync._truncate is True
+            # sync() / bulk must NOT be called on restart — WAL is sufficient
+            mock_es.assert_not_called()
+            # checkpoint advances to txmax so the next restart resumes from here
+            assert sync.checkpoint == txmax
+
+    @patch("pgsync.sync.SearchClient.bulk")
+    @patch("pgsync.sync.logger")
+    def test_pull_bootstrap(self, mock_logger, mock_es, sync):
+        """Bootstrap (no checkpoint): full table scan + WAL."""
+        txmax = 42
+        upto_lsn = "0/1234ABCD"
+        with (
+            patch(
+                "pgsync.sync.Sync.logical_slot_changes"
+            ) as mock_logical_slot_changes,
+            patch.object(
+                sync, "txmax_and_lsn", return_value=(txmax, upto_lsn)
+            ),
+            patch.object(
+                type(sync), "checkpoint", new_callable=PropertyMock
+            ) as mock_checkpoint,
+        ):
+            mock_checkpoint.return_value = (
+                None  # no checkpoint → bootstrap path
+            )
+            # no checkpoint set → txmin is None
+            sync.pull()
+            mock_logical_slot_changes.assert_called_once_with(
+                txmin=None,
+                txmax=txmax,
+                logical_slot_chunk_size=settings.LOGICAL_SLOT_CHUNK_SIZE,
+                upto_lsn=upto_lsn,
+            )
+            assert sync._truncate is True
+            # sync() / bulk MUST be called on bootstrap
             mock_es.assert_called_once_with("testdb", ANY)
+            # checkpoint must be set to txmax after WAL succeeds
+            mock_checkpoint.assert_any_call(txmax)
 
     @patch("pgsync.sync.SearchClient.bulk")
     @patch("pgsync.sync.logger")
@@ -1694,14 +1751,24 @@ class TestSync(object):
         assert sync.tree.root is not None
         assert sync.tree.root.table == "book"
 
-    @patch("pgsync.sync.Sync.logical_slot_get_changes")
-    def test_truncate_slots_when_truncate_true(self, mock_changes, sync):
-        """Test _truncate_slots calls logical_slot_get_changes when _truncate is True."""
+    @patch("pgsync.sync.Sync.logical_slot_advance")
+    def test_truncate_slots_when_truncate_true(self, mock_advance, sync):
+        """Test _truncate_slots advances the slot when _truncate is True and _safe_lsn is set."""
+        safe_lsn = "0/AABBCCDD"
         sync._truncate = True
+        sync._safe_lsn = safe_lsn
         sync._truncate_slots()
-        mock_changes.assert_called_once_with(
-            "testdb_testdb", upto_nchanges=None
-        )
+        mock_advance.assert_called_once_with("testdb_testdb", safe_lsn)
+
+    @patch("pgsync.sync.Sync.logical_slot_advance")
+    def test_truncate_slots_when_truncate_true_no_safe_lsn(
+        self, mock_advance, sync
+    ):
+        """Test _truncate_slots skips when _truncate is True but _safe_lsn is not yet set."""
+        sync._truncate = True
+        sync._safe_lsn = None
+        sync._truncate_slots()
+        mock_advance.assert_not_called()
 
     @patch("pgsync.sync.Sync.logical_slot_get_changes")
     def test_truncate_slots_when_truncate_false(self, mock_changes, sync):

@@ -750,7 +750,9 @@ class TestParentSingleChildFkOnChild(object):
         def poll_redis():
             return []
 
-        def poll_db():
+        def poll_db(**kwargs):
+            if (e := kwargs.get("listen_established")) is not None:
+                e.set()
             try:
                 session.execute(
                     book_cls.__table__.insert().values(
@@ -1071,7 +1073,9 @@ class TestParentSingleChildFkOnChild(object):
         def poll_redis():
             return []
 
-        def poll_db():
+        def poll_db(**kwargs):
+            if (e := kwargs.get("listen_established")) is not None:
+                e.set()
             with subtransactions(session):
                 session.execute(
                     rating_cls.__table__.update()
@@ -1180,7 +1184,9 @@ class TestParentSingleChildFkOnChild(object):
         def poll_redis():
             return []
 
-        def poll_db():
+        def poll_db(**kwargs):
+            if (e := kwargs.get("listen_established")) is not None:
+                e.set()
             try:
                 session.execute(
                     book_cls.__table__.insert().values(
