@@ -785,6 +785,18 @@ class Base(object):
             )
         )[0]
 
+    def slot_confirmed_flush_lsn(self, slot_name: str) -> str:
+        """Return the confirmed_flush_lsn for the named replication slot."""
+        rows = self.fetchall(
+            sa.select(sa.column("confirmed_flush_lsn"))
+            .select_from(sa.text("PG_REPLICATION_SLOTS"))
+            .where(sa.column("slot_name") == slot_name),
+            label="slot_confirmed_flush_lsn",
+        )
+        if not rows:
+            raise ValueError(f"Replication slot {slot_name!r} not found")
+        return str(rows[0][0])
+
     def txmax_and_lsn(self) -> t.Tuple[int, str]:
         """Atomically capture txid_current and pg_current_wal_lsn in one round-trip.
 
@@ -1311,6 +1323,12 @@ class Base(object):
 
 
 # helper methods
+
+
+def lsn_to_int(lsn: str) -> int:
+    """Convert a PostgreSQL LSN string (e.g. '0/1A2B3C') to a 64-bit integer."""
+    hi, lo = lsn.split("/")
+    return (int(hi, 16) << 32) | int(lo, 16)
 
 
 def subtransactions(session):

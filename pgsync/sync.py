@@ -34,7 +34,7 @@ from pgsync.base import pg_logical_repl_conn
 from pgsync.settings import IS_MYSQL_COMPAT
 
 from . import __version__, settings
-from .base import Base, Payload
+from .base import Base, lsn_to_int, Payload
 from .constants import (
     DELETE,
     INSERT,
@@ -77,6 +77,7 @@ from .utils import (
 )
 
 TX_BOUNDARY_RE = re.compile(r"^(BEGIN|COMMIT)\s+(\d+)", re.IGNORECASE)
+_HEARTBEAT_SENTINEL: dict = {"_heartbeat": True}
 
 
 logger = logging.getLogger(__name__)
@@ -525,6 +526,7 @@ class Sync(Base, metaclass=Singleton):
     ) -> None:
         """
         Render a single-line, in-place progress update for WAL streaming.
+        current and total are LSN byte offsets from the start of the range.
         """
         # prevent division by zero
         percent: float = (current / total * 100) if total else 0.0
@@ -535,7 +537,7 @@ class Sync(Base, metaclass=Singleton):
         end = "" if sys.stdout.isatty() else "\n"
         sys.stdout.write(
             f"{prefix}{timestamp} WAL {self.database}:{self.index} "
-            f"[{bar}] {format_number(current):>12}/{format_number(total):<12} ({percent:6.2f}%){end}"
+            f"[{bar}] {format_number(current):>12}B/{format_number(total):<12}B ({percent:6.2f}%){end}"
         )
         sys.stdout.flush()
 
@@ -573,13 +575,12 @@ class Sync(Base, metaclass=Singleton):
         limit: int = (
             logical_slot_chunk_size or settings.LOGICAL_SLOT_CHUNK_SIZE
         )
-        current: int = 0
-        total: int = self.logical_slot_count_changes(
-            self.__name,
-            txmin=txmin,
-            txmax=txmax,
-            upto_lsn=upto_lsn,
+        start_lsn_int: int = lsn_to_int(
+            self.slot_confirmed_flush_lsn(self.__name)
         )
+        end_lsn: str = upto_lsn or self.current_wal_lsn
+        total: int = lsn_to_int(end_lsn) - start_lsn_int
+        current: int = 0
         while True:
             # peek one chunk; no OFFSET - each advance moves the slot forward
             logger.debug(f"peek upto_lsn={upto_lsn!r} limit={limit}")
@@ -626,10 +627,11 @@ class Sync(Base, metaclass=Singleton):
                 ):
                     batch: list = list(run)
                     logger.debug(f"op: {op} tbl {tbl} - {len(batch)}")
-                    current += len(batch)
-                    self.log_xlog_progress(current, total, bar_length=30)
                     self.search_client.bulk(self.index, self._payloads(batch))
                     self.count["xlog"] += len(batch)
+
+            current = lsn_to_int(last_lsn) - start_lsn_int
+            self.log_xlog_progress(current, total, bar_length=30)
 
             # advance the slot without decoding WAL (pg_replication_slot_advance)
             end_lsn = self.logical_slot_advance(self.__name, last_lsn)
@@ -1466,11 +1468,11 @@ class Sync(Base, metaclass=Singleton):
             for l1 in chunks(
                 filters.get(self.tree.root.table), settings.FILTER_CHUNK_SIZE
             ):
-                if filters.get(node.table):
+                if filters.get(node.table) and not node.is_root:
                     for l2 in chunks(
                         filters.get(node.table), settings.FILTER_CHUNK_SIZE
                     ):
-                        if not node.is_root and filters.get(node.parent.table):
+                        if filters.get(node.parent.table):
                             for l3 in chunks(
                                 filters.get(node.parent.table),
                                 settings.FILTER_CHUNK_SIZE,
@@ -1682,6 +1684,8 @@ class Sync(Base, metaclass=Singleton):
             payloads = self.redis.pop()
 
         if payloads:
+            payloads = [p for p in payloads if not p.get("_heartbeat")]
+        if payloads:
             logger.debug(f"_poll_redis: {payloads}")
             with self.lock:
                 self.count["redis"] += len(payloads)
@@ -1705,6 +1709,8 @@ class Sync(Base, metaclass=Singleton):
     async def _async_poll_redis(self) -> None:
         payloads: list = self.redis.pop()
         if payloads:
+            payloads = [p for p in payloads if not p.get("_heartbeat")]
+        if payloads:
             logger.debug(f"_async_poll_redis: {payloads}")
             self.count["redis"] += len(payloads)
             await self.async_refresh_views()
@@ -1712,6 +1718,16 @@ class Sync(Base, metaclass=Singleton):
                 list(map(lambda payload: Payload(**payload), payloads))
             )
         await asyncio.sleep(settings.REDIS_POLL_INTERVAL)
+
+    @exception
+    async def async_heartbeat(self) -> None:
+        """Push a heartbeat sentinel every POLL_TIMEOUT seconds to advance the replication slot during quiet periods."""
+        while True:
+            await asyncio.sleep(settings.POLL_TIMEOUT)
+            self.redis.push([_HEARTBEAT_SENTINEL])
+            lsn: str = self.current_wal_lsn
+            with self._safe_lsn_lock:
+                self._safe_lsn = lsn
 
     @exception
     async def async_poll_redis(self) -> None:
@@ -1752,7 +1768,7 @@ class Sync(Base, metaclass=Singleton):
             # confirmed Redis durability, eliminating the race where slot
             # advancement could consume a commit whose NOTIFY hasn't reached
             # Redis yet.
-            lsn: str = self.current_wal_lsn()
+            lsn: str = self.current_wal_lsn
             with self._safe_lsn_lock:
                 self._safe_lsn = lsn
 
@@ -1767,6 +1783,8 @@ class Sync(Base, metaclass=Singleton):
                 if payloads:
                     _push_and_mark_safe(payloads)
                     payloads = []
+                else:
+                    _push_and_mark_safe([_HEARTBEAT_SENTINEL])
                 continue
 
             try:
@@ -2161,6 +2179,7 @@ class Sync(Base, metaclass=Singleton):
                 event_loop.create_task(self.async_poll_redis()),
                 event_loop.create_task(self.async_truncate_slots()),
                 event_loop.create_task(self.async_status()),
+                event_loop.create_task(self.async_heartbeat()),
             ]
 
         else:

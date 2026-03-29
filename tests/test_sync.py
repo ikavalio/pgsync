@@ -218,7 +218,7 @@ class TestSync(object):
         """When the slot is fully drained, confirmed_flush_lsn must reach upto_lsn."""
         upto_lsn = "0/ABC"
         with patch(
-            "pgsync.sync.Sync.logical_slot_count_changes", return_value=1
+            "pgsync.sync.Sync.slot_confirmed_flush_lsn", return_value="0/0"
         ):
             with patch(
                 "pgsync.sync.Sync.logical_slot_peek_changes"
@@ -249,7 +249,7 @@ class TestSync(object):
         upto_lsn = "0/ABC"
         txmax = 100
         with patch(
-            "pgsync.sync.Sync.logical_slot_count_changes", return_value=1
+            "pgsync.sync.Sync.slot_confirmed_flush_lsn", return_value="0/0"
         ):
             with patch(
                 "pgsync.sync.Sync.logical_slot_peek_changes"
@@ -1140,7 +1140,7 @@ class TestSync(object):
                 importlib.reload(settings)
                 for _ in sync._payloads(payloads):
                     pass
-        assert mock_sync.call_count == 25
+        assert mock_sync.call_count == 5
         assert mock_sync.call_args_list[-1] == call(
             filters={
                 "book": [
