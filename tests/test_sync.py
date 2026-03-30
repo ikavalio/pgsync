@@ -177,7 +177,9 @@ class TestSync(object):
                             ANY
                         ),  # peek upto_lsn=None limit=5000 (iteration 1)
                         call(ANY),  # batch last_lsn=... rows=...
-                        call("op: INSERT tbl book - 1"),
+                        call(
+                            "[db=testdb slot=testdb_testdb] op: INSERT tbl book - 1"
+                        ),
                         call("tg_op: INSERT table: public.book"),
                         call(ANY),  # slot advance: requested=...
                         call(
@@ -348,9 +350,15 @@ class TestSync(object):
                             ANY
                         ),  # peek upto_lsn=None limit=5000 (iteration 1)
                         call(ANY),  # batch last_lsn=... rows=...
-                        call("op: INSERT tbl book - 3"),
-                        call("op: UPDATE tbl book - 2"),
-                        call("op: INSERT tbl book - 2"),
+                        call(
+                            "[db=testdb slot=testdb_testdb] op: INSERT tbl book - 3"
+                        ),
+                        call(
+                            "[db=testdb slot=testdb_testdb] op: UPDATE tbl book - 2"
+                        ),
+                        call(
+                            "[db=testdb slot=testdb_testdb] op: INSERT tbl book - 2"
+                        ),
                         call(ANY),  # slot advance: requested=...
                         call(
                             ANY

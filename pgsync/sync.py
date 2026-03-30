@@ -156,6 +156,11 @@ class Sync(Base, metaclass=Singleton):
         return self.__name
 
     @property
+    def _log_prefix(self) -> str:
+        """Prefix for log messages to identify the replication slot and database."""
+        return f"[db={self.database} slot={self.__name}]"
+
+    @property
     def checkpoint_file(self) -> str:
         return os.path.join(settings.CHECKPOINT_PATH, f".{self.__name}")
 
@@ -583,7 +588,9 @@ class Sync(Base, metaclass=Singleton):
         current: int = 0
         while True:
             # peek one chunk; no OFFSET - each advance moves the slot forward
-            logger.debug(f"peek upto_lsn={upto_lsn!r} limit={limit}")
+            logger.debug(
+                f"{self._log_prefix} peek upto_lsn={upto_lsn!r} limit={limit}"
+            )
             raw: t.List[sa.engine.row.Row] = self.logical_slot_peek_changes(
                 slot_name=self.__name,
                 upto_lsn=upto_lsn,
@@ -600,7 +607,9 @@ class Sync(Base, metaclass=Singleton):
             # raw[-1] is always the COMMIT of the last-committed transaction,
             # whose LSN is the highest in the batch.
             last_lsn: str = raw[-1].lsn
-            logger.debug(f"batch last_lsn={last_lsn} rows={len(raw)}")
+            logger.debug(
+                f"{self._log_prefix} batch last_lsn={last_lsn} rows={len(raw)}"
+            )
 
             # parse and filter out BEGIN/COMMIT, pre-txmin rows, and unwanted schemas
             payloads: t.List[Payload] = []
@@ -626,7 +635,9 @@ class Sync(Base, metaclass=Singleton):
                     key=lambda payload: (payload.tg_op, payload.table),
                 ):
                     batch: list = list(run)
-                    logger.debug(f"op: {op} tbl {tbl} - {len(batch)}")
+                    logger.debug(
+                        f"{self._log_prefix} op: {op} tbl {tbl} - {len(batch)}"
+                    )
                     self.search_client.bulk(self.index, self._payloads(batch))
                     self.count["xlog"] += len(batch)
 
@@ -636,7 +647,7 @@ class Sync(Base, metaclass=Singleton):
             # advance the slot without decoding WAL (pg_replication_slot_advance)
             end_lsn = self.logical_slot_advance(self.__name, last_lsn)
             logger.debug(
-                f"slot advance: requested={last_lsn} end_lsn={end_lsn}"
+                f"{self._log_prefix} slot advance: requested={last_lsn} end_lsn={end_lsn}"
             )
 
         # Advance confirmed_flush_lsn all the way to the target LSN once the
@@ -644,7 +655,7 @@ class Sync(Base, metaclass=Singleton):
         final_lsn = upto_lsn or self.current_wal_lsn
         end_lsn = self.logical_slot_advance(self.__name, final_lsn)
         logger.debug(
-            f"slot final advance: requested={final_lsn} end_lsn={end_lsn}"
+            f"{self._log_prefix} slot final advance: requested={final_lsn} end_lsn={end_lsn}"
         )
 
         self.checkpoint = txmax or self.txid_current
@@ -2013,22 +2024,30 @@ class Sync(Base, metaclass=Singleton):
     ) -> None:
         # If we have buffered docs, send them
         if self._buffer:
-            logger.info(f"flushing buffer with {len(self._buffer)} docs")
+            logger.info(
+                f"{self._log_prefix} flushing buffer with {len(self._buffer)} docs"
+            )
             docs: list = []
             for (op, tbl), run in groupby(
                 self._buffer,
                 key=lambda payload: (payload.tg_op, payload.table),
             ):
                 batch: list = list(run)
-                logger.info(f"bulk group op={op} tbl={tbl} size={len(batch)}")
+                logger.info(
+                    f"{self._log_prefix} bulk group op={op} tbl={tbl} size={len(batch)}"
+                )
                 docs.extend(self._payloads(batch))
 
             if docs:
                 processed: int = len(self._buffer)
-                logger.info(f"sending bulk of {len(docs)} docs")
+                logger.info(
+                    f"{self._log_prefix} sending bulk of {len(docs)} docs"
+                )
                 self.search_client.bulk(self.index, docs)
                 self.count["xlog"] += processed
-                logger.info(f"sent bulk of {len(docs)} docs")
+                logger.info(
+                    f"{self._log_prefix} sent bulk of {len(docs)} docs"
+                )
 
             # if caller didn't provide a flush_lsn, then fall back to last buffered row
             if flush_lsn is None:
@@ -2041,18 +2060,22 @@ class Sync(Base, metaclass=Singleton):
         # Even if buffer was empty, we may want to ACK a COMMIT LSN
         if flush_lsn is not None and (force_ack or not self._buffer):
             cursor.send_feedback(flush_lsn=flush_lsn, force=True)
-            logger.info(f"sent feedback flush_lsn=P{flush_lsn}")
+            logger.info(
+                f"{self._log_prefix} sent feedback flush_lsn=P{flush_lsn}"
+            )
 
     def consume(self, message: t.Any) -> None:
         raw: t.Any = message.payload
         lsn: t.Optional[str] = message.data_start
         chunk_size: int = settings.LOGICAL_SLOT_CHUNK_SIZE
 
-        logger.debug(f"[LSN {lsn}] {raw}")
+        logger.debug(f"{self._log_prefix} [LSN {lsn}] {raw}")
 
         # Handle empty payloads gracefully
         if not raw or not raw.strip():
-            logger.debug(f"[LSN {lsn}] Empty payload, skipping")
+            logger.debug(
+                f"{self._log_prefix} [LSN {lsn}] Empty payload, skipping"
+            )
             return
 
         match = TX_BOUNDARY_RE.match(raw)
@@ -2098,7 +2121,9 @@ class Sync(Base, metaclass=Singleton):
             options={"include-xids": "1", "skip-empty-xacts": "1"},
             decode=True,  # gets you str instead of bytes
         )
-        logger.info("Starting logical replication stream (test_decoding)...")
+        logger.info(
+            f"{self._log_prefix} Starting logical replication stream (test_decoding)..."
+        )
         cursor.consume_stream(self.consume)
 
     @threaded
